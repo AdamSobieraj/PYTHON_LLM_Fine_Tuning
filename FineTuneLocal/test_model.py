@@ -1,32 +1,65 @@
 # test_model.py
 # Uruchom: python test_model.py
-# Lokalizacja modelu: E:\PROJEKTY\PYTHON_Fine_Tuning\FineTuneLocal\fine_tuned_local\
 
 import os
+from pathlib import Path
+
+# Wymuś single GPU
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
+
 import torch
+
+# Opcjonalne wczytanie .env
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
+
 from transformers import AutoTokenizer, AutoModelForCausalLM
+
+try:
+    from peft import PeftModel
+    PEFT_AVAILABLE = True
+except Exception:
+    PEFT_AVAILABLE = False
+
 
 # =========================
 # KONFIGURACJA
 # =========================
 
-# Ścieżka do wytrenowanego modelu (po merge)
-MODEL_PATH = "fine_tuned_local"
+# Główna ścieżka do modelu:
+# - może być pełnym modelem,
+# - może być merged modelem,
+# - może być adapterem PEFT.
+MODEL_PATH = os.getenv("MODEL_PATH", "fine_tuned_local")
 
-# Alternatywnie - sam adapter (wymaga bazowego modelu):
-# MODEL_PATH = "lora_adapter"
-# BASE_MODEL = "HuggingFaceTB/SmolLM2-360M-Instruct"
+# Wymagane TYLKO, jeśli MODEL_PATH to adapter.
+# Może być:
+# - ID z Hugging Face, np. "HuggingFaceTB/SmolLM2-360M-Instruct"
+# - albo lokalna ścieżka do bazowego modelu.
+BASE_MODEL = os.getenv("BASE_MODEL") or os.getenv("MODEL_ID")
 
-SYSTEM_PROMPT = (
+SYSTEM_PROMPT = os.getenv("SYSTEM_PROMPT") or (
     "Classify the article into exactly one category: "
     "business, entertainment, politics, sport, tech. "
     "Reply with only the category word."
 )
 
-CATEGORIES = {"business", "entertainment", "politics", "sport", "tech"}
+categories_raw = os.getenv("CATEGORIES") or "business,entertainment,politics,sport,tech"
+CATEGORIES = {
+    category.strip()
+    for category in categories_raw.split(",")
+    if category.strip()
+}
 
-# Wymuś single GPU
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+# Opcjonalnie: merge adaptera w pamięci przed inferencją.
+# Domyślnie wyłączony, żeby nie zwiększać zużycia VRAM.
+MERGE_FOR_INFERENCE = (
+    os.getenv("MERGE_FOR_INFERENCE", "0").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
 
 
 # =========================
@@ -35,14 +68,25 @@ os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 cuda = torch.cuda.is_available()
 bf16 = cuda and torch.cuda.is_bf16_supported()
+fp16 = cuda and not bf16
+
+dtype = torch.bfloat16 if bf16 else (
+    torch.float16 if fp16 else torch.float32
+)
+
+device_map = {"": 0} if cuda else "cpu"
 
 print("=" * 50)
 print("CUDA available:", cuda)
 print("BF16:", bf16)
+print("FP16:", fp16)
 
 if cuda:
     print(f"GPU: {torch.cuda.get_device_name(0)}")
     print(f"VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+
+print("Model path:", os.path.abspath(MODEL_PATH))
+print("Base model:", BASE_MODEL)
 print("=" * 50)
 
 
@@ -50,22 +94,88 @@ print("=" * 50)
 # ŁADOWANIE MODELU
 # =========================
 
-print(f"\nLoading model from: {os.path.abspath(MODEL_PATH)}")
+def load_model_and_tokenizer(model_path: str):
+    """
+    Ładuje:
+    1) pełny model,
+    2) merged model,
+    3) adapter PEFT + bazowy model.
+    """
 
-tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
+    path = Path(model_path)
 
-if tokenizer.pad_token is None:
-    tokenizer.pad_token = tokenizer.eos_token
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Nie znaleziono ścieżki modelu: {os.path.abspath(model_path)}"
+        )
 
-model = AutoModelForCausalLM.from_pretrained(
-    MODEL_PATH,
-    dtype=torch.bfloat16 if bf16 else torch.float32,
-    device_map={"": 0} if cuda else "cpu",
-    trust_remote_code=True,
-)
+    print(f"\nLoading tokenizer from: {os.path.abspath(model_path)}")
+    tokenizer = AutoTokenizer.from_pretrained(str(path))
 
-model.eval()
-print("Model loaded successfully!\n")
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    is_adapter = (
+        (path / "adapter_config.json").exists()
+        or (path / "adapter_model.safetensors").exists()
+        or (path / "adapter_model.bin").exists()
+    )
+
+    if is_adapter:
+        if BASE_MODEL is None:
+            raise RuntimeError(
+                "Wykryto adapter PEFT w folderze MODEL_PATH.\n"
+                "Musisz podać bazowy model, np.:\n"
+                "BASE_MODEL=HuggingFaceTB/SmolLM2-360M-Instruct\n"
+                "lub:\n"
+                "MODEL_ID=HuggingFaceTB/SmolLM2-360M-Instruct"
+            )
+
+        if not PEFT_AVAILABLE:
+            raise RuntimeError(
+                "Wykryto adapter PEFT, ale biblioteka peft nie jest dostępna.\n"
+                "Zainstaluj ją:\n"
+                "pip install peft"
+            )
+
+        print(f"\nDetected PEFT adapter: {os.path.abspath(model_path)}")
+        print(f"Loading base model: {BASE_MODEL}")
+
+        base_model = AutoModelForCausalLM.from_pretrained(
+            BASE_MODEL,
+            torch_dtype=dtype,
+            device_map=device_map,
+            trust_remote_code=True,
+            low_cpu_mem_usage=True,
+        )
+
+        model = PeftModel.from_pretrained(base_model, str(path))
+
+        if MERGE_FOR_INFERENCE:
+            try:
+                model = model.merge_and_unload()
+                print("Adapter merged into base model for inference.")
+            except Exception as e:
+                print(f"Could not merge adapter for inference: {e}")
+                print("Continuing with PeftModel...")
+    else:
+        print(f"\nLoading full/merged model from: {os.path.abspath(model_path)}")
+
+        model = AutoModelForCausalLM.from_pretrained(
+            str(path),
+            torch_dtype=dtype,
+            device_map=device_map,
+            trust_remote_code=True,
+            low_cpu_mem_usage=True,
+        )
+
+    model.eval()
+    print("Model loaded successfully!\n")
+
+    return tokenizer, model
+
+
+tokenizer, model = load_model_and_tokenizer(MODEL_PATH)
 
 
 # =========================
@@ -93,16 +203,17 @@ def classify(text: str, verbose: bool = False) -> str:
 
     inputs = tokenizer(prompt, return_tensors="pt")
 
-    if cuda:
-        inputs = {k: v.to("cuda:0") for k, v in inputs.items()}
+    # Bezpiecznie pobierz urządzenie, na którym stoi model.
+    device = next(model.parameters()).device
+    inputs = {k: v.to(device) for k, v in inputs.items()}
 
-    with torch.no_grad():
+    with torch.inference_mode():
         output_ids = model.generate(
             **inputs,
             max_new_tokens=16,
             do_sample=False,
-            temperature=1.0,
             pad_token_id=tokenizer.eos_token_id,
+            eos_token_id=tokenizer.eos_token_id,
         )
 
     # Dekoduj tylko nowe tokeny
@@ -115,6 +226,7 @@ def classify(text: str, verbose: bool = False) -> str:
 
     if verbose:
         print(f"[RAW OUTPUT] {raw_answer!r}")
+        print(f"[CLEAN OUTPUT] {clean!r}")
 
     return final
 
@@ -147,7 +259,7 @@ total = len(test_cases)
 for i, (text, expected) in enumerate(test_cases, 1):
     result = classify(text)
     status = "OK" if result == expected else "NOT OK"
-    correct += result == expected
+    correct += int(result == expected)
 
     print(f"{status} [{i:2d}] {result:>15s} | expected: {expected:>15s}")
     print(f"       Text: {text[:70]}...")

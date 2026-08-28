@@ -29,14 +29,18 @@ def _apply_trl_patch():
 _apply_trl_patch()
 
 
+# ============================================================
+# Importy wymagane dopiero po patchu TRL
+# ============================================================
 from datasets import load_dataset
 from transformers import (
     AutoTokenizer,
     AutoModelForCausalLM,
-    BitsAndBytesConfig,
 )
-from peft import LoraConfig, PeftModel, prepare_model_for_kbit_training
+from peft import PeftModel
 from trl import SFTTrainer, SFTConfig
+
+from peft_methods import create_peft_method, PEFTOptions, DoRA
 
 
 # ============================================================
@@ -78,7 +82,7 @@ class QLoRASFTWorkflow:
         self.cuda = None
         self.bf16 = None
         self.fp16 = None
-        self.use_4bit = bool(os.getenv("USE_4BIT"))
+        self.use_4bit = False
 
         self.tokenizer = None
         self.bnb_config = None
@@ -91,6 +95,12 @@ class QLoRASFTWorkflow:
         self.peft_config = None
         self.sft_config = None
         self.trainer = None
+
+        self.peft_options = PEFTOptions.from_env()
+        self.peft_method = create_peft_method(
+            os.getenv("PEFT_METHOD"),
+            self.peft_options,
+        )
 
     # ========================================================
     # HELPER: wymagana zmienna środowiskowa
@@ -129,12 +139,18 @@ class QLoRASFTWorkflow:
         self.bf16 = self.cuda and torch.cuda.is_bf16_supported()
         self.fp16 = self.cuda and not torch.cuda.is_bf16_supported()
 
+        self.use_4bit = self.peft_options.use_4bit
+
         print("CUDA available:", self.cuda)
         print("BF16:", self.bf16)
         print("FP16:", self.fp16)
+        print("PEFT method:", self.peft_method.name)
+        print("USE_4BIT:", self.use_4bit)
 
-        if self.use_4bit and not self.cuda:
-            print("WARNING: QLoRA 4-bit wymaga CUDA. Wyłączam USE_4BIT.")
+        if self.peft_method.name == "qlora" and not self.cuda:
+            print("WARNING: QLoRA wymaga CUDA. Przełączam na DoRA.")
+            self.peft_options.use_4bit = False
+            self.peft_method = DoRA(self.peft_options)
             self.use_4bit = False
 
     # ========================================================
@@ -149,18 +165,18 @@ class QLoRASFTWorkflow:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
     # ========================================================
-    # KONFIGURACJA QLoRA
+    # KONFIGURACJA PEFT / QLoRA / DoRA
     # ========================================================
-    def configure_quantization(self):
-        self.bnb_config = None
+    def configure_peft(self):
+        print("Configuring PEFT method:", self.peft_method.name)
 
-        if self.use_4bit:
-            self.bnb_config = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_quant_type="nf4",
-                bnb_4bit_compute_dtype=torch.bfloat16 if self.bf16 else torch.float16,
-                bnb_4bit_use_double_quant=True,
-            )
+        self.bnb_config = self.peft_method.quantization_config()
+        self.peft_config = self.peft_method.peft_config()
+
+        if self.peft_config is None:
+            print("Full fine-tuning mode: no PEFT adapter will be used.")
+        else:
+            print("PEFT adapter mode: adapter will be trained.")
 
     # ========================================================
     # MODEL
@@ -185,16 +201,8 @@ class QLoRASFTWorkflow:
         print("Loading base model:", model_id)
         self.model = AutoModelForCausalLM.from_pretrained(model_id, **model_kwargs)
 
-        if self.use_4bit:
-            self.model = prepare_model_for_kbit_training(
-                self.model,
-                use_gradient_checkpointing=True,
-            )
-
-        try:
-            self.model.enable_input_require_grads()
-        except AttributeError:
-            pass
+        self.model = self.peft_method.prepare_model(self.model)
+        self.peft_method.enable_input_require_grads(self.model)
 
     # ========================================================
     # DANE
@@ -243,19 +251,6 @@ class QLoRASFTWorkflow:
         print("Eval samples:", len(self.eval_ds) if self.eval_ds is not None else 0)
 
     # ========================================================
-    # LORA CONFIG
-    # ========================================================
-    def configure_lora(self):
-        self.peft_config = LoraConfig(
-            task_type="CAUSAL_LM",
-            r=16,
-            lora_alpha=32,
-            lora_dropout=0.05,
-            target_modules=["q_proj", "v_proj"],
-            bias="none",
-        )
-
-    # ========================================================
     # SFT CONFIG
     # ========================================================
     def configure_sft(self):
@@ -294,14 +289,20 @@ class QLoRASFTWorkflow:
     def create_trainer(self):
         print("Creating PatchedSFTTrainer...")
 
-        self.trainer = PatchedSFTTrainer(
-            model=self.model,
-            processing_class=self.tokenizer,
-            train_dataset=self.train_ds,
-            eval_dataset=self.eval_ds,
-            args=self.sft_config,
-            peft_config=self.peft_config,
-        )
+        trainer_kwargs = {
+            "model": self.model,
+            "processing_class": self.tokenizer,
+            "train_dataset": self.train_ds,
+            "eval_dataset": self.eval_ds,
+            "args": self.sft_config,
+        }
+
+        if self.peft_config is not None:
+            trainer_kwargs["peft_config"] = self.peft_config
+        else:
+            print("Full fine-tuning: peft_config disabled.")
+
+        self.trainer = PatchedSFTTrainer(**trainer_kwargs)
 
     # ========================================================
     # TRENING
@@ -327,7 +328,11 @@ class QLoRASFTWorkflow:
         self.trainer.save_model(adapter_dir)
         self.tokenizer.save_pretrained(adapter_dir)
 
-        print("\nSaved adapter to:", adapter_dir)
+        if self.peft_config is None:
+            print("\nSaved FULL model to:", adapter_dir)
+        else:
+            print("\nSaved adapter to:", adapter_dir)
+
         print("Files:", os.listdir(adapter_dir))
 
     # ========================================================
@@ -380,6 +385,10 @@ class QLoRASFTWorkflow:
     # MERGE
     # ========================================================
     def merge(self):
+        if self.peft_config is None:
+            print("\nFull fine-tuning: merge skipped because model is already full.")
+            return
+
         if os.getenv("MERGE_MODEL"):
             print("\nMerging LoRA into base model...")
 
@@ -419,10 +428,9 @@ class QLoRASFTWorkflow:
         self.diagnose()
         self.detect_hardware()
         self.load_tokenizer()
-        self.configure_quantization()
+        self.configure_peft()
         self.load_model()
         self.prepare_data()
-        self.configure_lora()
         self.configure_sft()
         self.create_trainer()
         self.train()
