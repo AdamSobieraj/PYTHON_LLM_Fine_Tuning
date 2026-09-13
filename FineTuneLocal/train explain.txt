@@ -1,0 +1,269 @@
+=========================================================================
+ local_finetune.py - EXPLANATION (a guide to learning how to fine-tune)
+=========================================================================
+
+WHAT THIS SCRIPT DOES (one line)
+- It takes a small pre-trained language model (SmolLM2-360M-Instruct),
+  teaches it a specific job (classify a news article into one of:
+  business / entertainment / politics / sport / tech), and saves the
+  result so it can be used for inference.
+
+The whole script is one workflow class (QLoRASFTWorkflow) whose run()
+method calls these steps IN ORDER. Understanding the order is the key:
+
+  diagnose -> detect_hardware -> load_tokenizer -> configure_peft
+  -> load_model -> prepare_data -> configure_sft -> create_trainer
+  -> train -> save -> test -> merge
+
+-------------------------------------------------------------------------
+STEP 0 - SETUP / PATCHES  (top of file, lines 1-43)
+-------------------------------------------------------------------------
+- load_dotenv()
+    Why: reads your .env file so all settings (model id, paths, method,
+    learning rate...) come from one place instead of being hard-coded.
+    Rule of thumb: keep every tunable in .env, keep the logic in code.
+
+- os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+    Why: forces the script to use only GPU #0. On a multi-GPU box this
+    stops frameworks from accidentally splitting work across cards.
+
+- _apply_trl_patch()
+    Why: TRL's SFTTrainer has an internal "chunked cross-entropy"
+    optimisation that can break with a standard model. This monkey-patch
+    disables it (replaces it with a no-op) so training uses a plain,
+    reliable loss. It's a workaround, not a normal part of fine-tuning.
+
+- Imports (datasets, transformers, peft, trl, peft_methods)
+    Why:
+      * datasets     -> load & transform the JSONL training file
+      * transformers -> load the tokenizer + the causal LM (the model)
+      * peft         -> LoRA/DoRA adapters and merging
+      * trl          -> SFTTrainer/SFTConfig, the high-level training loop
+      * peft_methods -> YOUR helper that decides full vs LoRA vs DoRA vs QLoRA
+
+- PatchedSFTTrainer (lines 49-74)
+    What: a subclass of SFTTrainer that overrides compute_loss().
+    Why: it computes the standard "shifted" language-modeling loss:
+        shift the logits by one position (token t predicts token t+1)
+        and use CrossEntropyLoss with ignore_index=-100.
+    The -100 is the magic: any label position set to -100 is IGNORED in
+    the loss. This is what lets us train ONLY on the answer (see Step 5).
+
+-------------------------------------------------------------------------
+STEP 1 - diagnose()   (lines 121-132)
+-------------------------------------------------------------------------
+- Prints torch version, whether CUDA is available, and lists every GPU
+  (name + VRAM).
+- Why: fine-tuning failures are usually hardware/memory problems.
+  Seeing your GPU and its VRAM at startup tells you what is realistic.
+
+-------------------------------------------------------------------------
+STEP 2 - detect_hardware()   (lines 137-154)
+-------------------------------------------------------------------------
+- Decides which precision to train in:
+    bf16  -> if CUDA + bf16 supported (most modern GPUs) - best stability
+    fp16  -> if CUDA but no bf16
+    fp32  -> CPU fallback (slow, big)
+  Why: half precision is ~2x faster and half the memory; bf16 is more
+  numerically stable than fp16 for training.
+- Reads USE_4BIT from env (for QLoRA).
+- Guard: if method is QLoRA but there is no CUDA, it falls back to DoRA,
+  because 4-bit quantised training (bitsandbytes) needs a GPU.
+
+-------------------------------------------------------------------------
+STEP 3 - load_tokenizer()   (lines 159-165)
+-------------------------------------------------------------------------
+- Loads the tokenizer for MODEL_ID.
+- If there is no pad_token, it reuses eos_token as the pad.
+- Why: batching needs a pad token; without one, padding would crash or
+  behave oddly. Tokenizer and model must always come from the SAME model.
+
+-------------------------------------------------------------------------
+STEP 4 - configure_peft()   (lines 170-179)
+-------------------------------------------------------------------------
+- Asks your peft_method object for two things:
+    quantization_config() -> bnb_config (only for QLoRA/4-bit, else None)
+    peft_config()         -> the LoRA/DoRA adapter config, OR None for full
+- Why: this is the ONE switch that decides the two very different paths:
+    * peft_config is None  -> FULL fine-tuning (train every weight)
+    * peft_config is set   -> PEFT (train a small adapter, base is frozen)
+
+  THE CORE CONCEPT - fine-tuning vs PEFT:
+    FULL: every parameter of the model is updated. Most powerful, but
+          needs lots of memory and can "forget" general knowledge.
+    LoRA / DoRA: the big model is FROZEN; only a tiny set of extra
+          matrices (the "adapter") is trained. Much cheaper, very
+          effective for focused tasks, and the adapter is a small file.
+    QLoRA: LoRA on top of a 4-bit-quantised base model -> cheapest of all,
+          lets you fine-tune big models on small GPUs.
+  Rule of thumb: for a small model + a focused task, LoRA is usually the
+  best default; full fine-tuning needs a careful low learning rate.
+
+-------------------------------------------------------------------------
+STEP 5 - load_model()   (lines 184-205)
+-------------------------------------------------------------------------
+- Chooses dtype (bf16/fp16/fp32) based on Step 2.
+- Loads the base model with AutoModelForCausalLM.from_pretrained(...):
+    * trust_remote_code, low_cpu_mem_usage -> safety + memory efficiency
+    * device_map {"": 0} -> put the whole model on GPU 0
+    * quantization_config -> only present for QLoRA (loads in 4-bit)
+- Then:
+    peft_method.prepare_model(model)
+        Why: for LoRA/DoRA this injects the adapter layers into the model
+             and FREEZES the original weights. For "full" it's a no-op.
+    peft_method.enable_input_require_grads(model)
+        Why: needed so gradients flow into the (quantised) embeddings when
+             doing LoRA on a frozen base.
+
+-------------------------------------------------------------------------
+STEP 6 - prepare_data()  (lines 210-256)   <-- MOST IMPORTANT FOR THIS TASK
+-------------------------------------------------------------------------
+- Loads the JSONL file (DATA_FILE). Each row looks like:
+    {"messages":[{system...},{user: <article>},{assistant: "sport"}]}
+- _to_prompt_completion() SPLITs each row into two parts:
+      prompt     = [ system, user ]   (the question / the article)
+      completion = [ assistant ]      (the answer / the category word)
+  WHY THIS IS CRITICAL:
+    In TRL, if you give it prompt+completion it enables "completion_only
+    loss" and masks the prompt. That means the loss is computed ONLY on
+    the answer tokens (e.g. the single word "sport"), NOT on the whole
+    article.
+    If instead you gave one flat "text" string, the model would be trained
+    to reconstruct the entire article, and the 1-word answer would be a
+    tiny fraction of the signal -> the model barely learns to classify.
+    This single change is usually the difference between a model that
+    "always guesses one word" and one that actually classifies.
+    General lesson: for "predict a short answer" tasks, ALWAYS mask the
+    prompt and put the loss only on the answer.
+- Splits 90% train / 10% eval (seed=42 for reproducibility), so the
+  trainer can watch eval loss each epoch and you can catch overfitting.
+  (If there are <20 rows it skips the eval split.)
+
+-------------------------------------------------------------------------
+STEP 7 - configure_sft()   (lines 261-316)
+-------------------------------------------------------------------------
+Builds SFTConfig (the hyper-parameters). The ones that matter and why:
+
+- learning_rate (LR)
+    * default 3e-5 for FULL, 2e-4 for LoRA/DoRA/QLoRA (overridable via
+      LEARNING_RATE in .env).
+    Why the two values differ: full fine-tuning moves every weight, so a
+      large LR destroys the pre-trained knowledge (model collapses /
+      outputs garbage). LoRA only moves a tiny adapter, so it tolerates a
+      much higher LR. Picking the wrong one is the #1 cause of "bad
+      model" results.
+- batch_size=4, gradient_accumulation_steps=2
+    -> effective batch = 4 * 2 = 8. Why: gradient accumulation simulates a
+       bigger batch without needing more GPU memory.
+- num_epochs=3
+    Why: how many full passes over the data. Too few = underfits; too many
+      = overfits (memorises). Watch eval loss to pick a good number.
+- warmup_steps (computed from WARMUP_RATIO, default 5% of total steps)
+    Why: at the very start the model is fragile; ramping the LR up
+      gradually (instead of starting at full strength) stabilises
+      training and prevents early collapse.
+    (Note: this TRL version wants warmup_STEPS, not warmup_RATIO, so the
+      script converts the ratio into an absolute step count.)
+- max_length (MAX_LEN)
+    Why: caps sequence length so long articles don't blow up memory /
+      slow training.
+- bf16/fp16 flags
+    Why: enable mixed precision training (matches Step 2).
+- save_strategy="epoch" + load_best_model_at_end + metric_for_best_model
+    Why: saves a checkpoint every epoch, and at the end restores the
+      checkpoint with the BEST eval loss (not the last one). This guards
+      against using an over-trained model.
+- report_to=[]
+    Why: disables Weights & Biases / other trackers (offline, no account).
+
+-------------------------------------------------------------------------
+STEP 8 - create_trainer()   (lines 321-337)
+-------------------------------------------------------------------------
+- Wires the model + tokenizer + datasets + config into PatchedSFTTrainer.
+- If peft_config is set (LoRA/DoRA/QLoRA), it passes peft_config so the
+  trainer knows to train the adapter; for full it is left off.
+- Why a "Patched" trainer: to use the simple, reliable compute_loss from
+  Step 0 (see PatchedSFTTrainer).
+
+-------------------------------------------------------------------------
+STEP 9 - train()   (lines 342-352)
+-------------------------------------------------------------------------
+- self.trainer.train() runs the whole optimisation loop: forward pass,
+  compute loss (only on the answer tokens), backward pass, update the
+  trainable weights (adapter, or everything if full).
+- Prints final epoch/step and the last log entries (loss over time).
+- Why: a healthy run shows loss going DOWN over the steps. If it stays
+  flat or spikes, something is wrong (usually LR or data masking).
+
+-------------------------------------------------------------------------
+STEP 10 - save()   (lines 357-373)
+-------------------------------------------------------------------------
+- FULL: saves the complete model to MERGED_DIR.
+- LoRA/DoRA/QLoRA: saves the small adapter to ADAPTER_DIR.
+- Also saves the tokenizer next to it (so the model is self-contained).
+- WHY THE TWO DIFFERENT FOLDERS:
+    full -> the artifact is a whole model, and it is saved straight to the
+            folder that test_model.py reads (MERGED_DIR). No merge needed.
+    lora -> the artifact is a tiny adapter; the base model is NOT saved
+            here (it's already on disk / on Hugging Face).
+  Common pitfall: testing a STALE model. If you save to one folder but
+  test a different (old) folder, you'll grade an old run. Keep the
+  "save to" folder and the "test from" folder (MODEL_PATH) the SAME.
+
+-------------------------------------------------------------------------
+STEP 11 - test()   (lines 378-419)
+-------------------------------------------------------------------------
+- A quick built-in sanity check: feed one example
+  ("A new mobile phone is launched") through the freshly trained model
+  and print the predicted category.
+- Uses apply_chat_template (same format used in training) + greedy
+  generation (do_sample=False) for a deterministic answer.
+- Why: an immediate, cheap signal that the model is doing the task at all,
+  before you rely on the bigger test_model.py evaluation.
+
+-------------------------------------------------------------------------
+STEP 12 - merge()   (lines 424-466)
+-------------------------------------------------------------------------
+- For FULL: there is nothing to merge (the whole model is already saved),
+  so it just skips. This is the "merge skipped / model is already full"
+  message.
+- For LoRA/DoRA/QLoRA (if MERGE_MODEL is set):
+      load the frozen base model + the trained adapter -> merge_and_unload()
+      -> save one standalone model to MERGED_DIR.
+  WHY MERGE: an adapter alone can't run by itself; it must be attached to
+    the base model. Merging bakes the small adapter into the base weights
+    so the final model is a normal, drop-in model you can load anywhere
+    (Ollama, LM Studio, transformers) without thinking about adapters.
+  If you do NOT merge, you can still use the adapter by loading base +
+  adapter together (PeftModel) - that's what test_model.py also supports.
+
+-------------------------------------------------------------------------
+HOW IT ALL FITS TOGETHER (the mental model)
+-------------------------------------------------------------------------
+1. Choose a base model + a clear task (SYSTEM_PROMPT defines the task).
+2. Choose HOW MUCH to train: full (heavy, low LR) vs LoRA (light, high LR).
+3. Give it examples as (prompt -> answer), and put the loss ONLY on the
+   answer.
+4. Pick a sensible learning rate for YOUR method + a short warmup.
+5. Train a few epochs, watch loss go down, keep the best checkpoint.
+6. Save to one folder; test FROM that same folder.
+7. (Optional) Merge an adapter into the base for a standalone model.
+
+-------------------------------------------------------------------------
+KEY LESSONS (why the common things go wrong)
+- Wrong learning rate for the method  -> model collapses or doesn't learn.
+  Full needs a small LR (~2e-5..5e-5); LoRA can use ~1e-4..3e-4.
+- Loss over the whole text instead of the answer -> model barely learns the
+  target. Fix: prompt/completion split (completion-only loss).
+- Testing a stale/old model folder -> you grade a previous run, not this one.
+  Keep save-folder == test-folder.
+- No warmup + high LR -> unstable first steps.
+- Too many epochs on a small dataset -> overfitting (memorisation).
+
+
+-------------------------------------------------------------------------
+RUNNING IT
+-------------------------------------------------------------------------
+- Configure .env (MODEL_ID, DATA_FILE, PEFT_METHOD, paths, LR, ...).
+- Train:  python local_finetune.py
+- Evaluate a saved model:  python test_model.py   (reads MODEL_PATH)

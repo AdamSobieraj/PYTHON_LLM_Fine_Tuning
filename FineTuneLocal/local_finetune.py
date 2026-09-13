@@ -207,23 +207,28 @@ class QLoRASFTWorkflow:
     # ========================================================
     # DANE
     # ========================================================
-    def _to_text(self, example):
+    def _to_prompt_completion(self, example):
+        # Rozdzielamy na prompt (system + user) i completion (assistant),
+        # zeby loss liczyl sie TYLKO na odpowiedzi (slowo kategorii), a nie na calym tekscie.
         system_prompt = os.getenv("SYSTEM_PROMPT", "")
 
-        messages = [{"role": "system", "content": system_prompt}]
-
+        user_content = None
+        assistant_content = None
         for msg in example["messages"]:
-            if msg["role"] == "system":
-                continue
-            messages.append(msg)
+            if msg["role"] == "user":
+                user_content = msg["content"]
+            elif msg["role"] == "assistant":
+                assistant_content = msg["content"]
 
-        if messages[-1]["role"] != "assistant":
-            raise ValueError(
-                "Każdy przykład musi kończyć się wiadomością 'assistant'."
-            )
+        if user_content is None or assistant_content is None:
+            raise ValueError("Przyklad musi zawierac wiadomosc 'user' i 'assistant'.")
 
-        text = self.tokenizer.apply_chat_template(messages, tokenize=False)
-        return {"text": text}
+        prompt = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+        ]
+        completion = [{"role": "assistant", "content": assistant_content}]
+        return {"prompt": prompt, "completion": completion}
 
     def prepare_data(self):
         data_file = self._require_env("DATA_FILE")
@@ -232,18 +237,18 @@ class QLoRASFTWorkflow:
         raw = load_dataset("json", data_files=data_file)
         train_raw = raw["train"]
 
-        text_ds = train_raw.map(
-            self._to_text,
+        pc_ds = train_raw.map(
+            self._to_prompt_completion,
             remove_columns=train_raw.column_names,
         )
 
-        if len(text_ds) >= 20:
-            split = text_ds.train_test_split(test_size=0.1, seed=42)
+        if len(pc_ds) >= 20:
+            split = pc_ds.train_test_split(test_size=0.1, seed=42)
             self.train_ds = split["train"]
             self.eval_ds = split["test"]
             self.eval_strategy = "epoch"
         else:
-            self.train_ds = text_ds
+            self.train_ds = pc_ds
             self.eval_ds = None
             self.eval_strategy = "no"
 
@@ -257,17 +262,44 @@ class QLoRASFTWorkflow:
         adapter_dir = self._require_env("ADAPTER_DIR")
         max_len = int(self._require_env("MAX_LEN"))
 
+        # Domyslna LR zalezy od metody:
+        # - full fine-tuning: NISKA LR (za wysoka niszczy wagi pretrained modelu)
+        # - LoRA/DoRA/QLoRA: wysoka LR jest OK
+        default_lr = 3e-5 if self.peft_method.name == "full" else 2e-4
+
+        lr_env = os.getenv("LEARNING_RATE")
+        learning_rate = float(lr_env) if lr_env else default_lr
+
+        batch_size = 4
+        grad_accum = 2
+        num_epochs = 3
+
+        # TRL 1.x nie przyjmuje parametru 'warmup_ratio' - przeliczamy na 'warmup_steps'
+        warmup_env = os.getenv("WARMUP_RATIO")
+        warmup_ratio = float(warmup_env) if warmup_env else 0.05
+
+        n_train = len(self.train_ds) if self.train_ds is not None else 0
+        total_steps = 0
+        if n_train > 0:
+            steps_per_epoch = -(-n_train // (batch_size * grad_accum))  # dzielenie z zaokr. w gore
+            total_steps = steps_per_epoch * num_epochs
+        warmup_steps = max(1, int(round(total_steps * warmup_ratio))) if total_steps else 10
+
+        print(f"PEFT method: {self.peft_method.name}")
+        print(f"Learning rate: {learning_rate} (default for this method: {default_lr})")
+        print(f"Warmup steps: {warmup_steps} (ratio {warmup_ratio}, total steps ~{total_steps})")
+
         self.sft_config = SFTConfig(
             output_dir=adapter_dir,
-            dataset_text_field="text",
             max_length=max_len,
 
-            per_device_train_batch_size=4,
+            per_device_train_batch_size=batch_size,
             per_device_eval_batch_size=4,
-            gradient_accumulation_steps=2,
+            gradient_accumulation_steps=grad_accum,
 
-            num_train_epochs=3,
-            learning_rate=2e-4,
+            num_train_epochs=num_epochs,
+            learning_rate=learning_rate,
+            warmup_steps=warmup_steps,
 
             logging_steps=10,
             save_strategy="epoch",
@@ -323,17 +355,22 @@ class QLoRASFTWorkflow:
     # ZAPIS
     # ========================================================
     def save(self):
-        adapter_dir = self._require_env("ADAPTER_DIR")
+        # full fine-tuning: pelny model zapisujemy do MERGED_DIR (sciezka czytana w test_model.py)
+        # LoRA/DoRA/QLoRA: adapter zapisujemy do ADAPTER_DIR
+        if self.peft_config is None:
+            out_dir = self._require_env("MERGED_DIR")
+        else:
+            out_dir = self._require_env("ADAPTER_DIR")
 
-        self.trainer.save_model(adapter_dir)
-        self.tokenizer.save_pretrained(adapter_dir)
+        self.trainer.save_model(out_dir)
+        self.tokenizer.save_pretrained(out_dir)
 
         if self.peft_config is None:
-            print("\nSaved FULL model to:", adapter_dir)
+            print("\nSaved FULL model to:", out_dir)
         else:
-            print("\nSaved adapter to:", adapter_dir)
+            print("\nSaved adapter to:", out_dir)
 
-        print("Files:", os.listdir(adapter_dir))
+        print("Files:", os.listdir(out_dir))
 
     # ========================================================
     # TEST
@@ -385,8 +422,15 @@ class QLoRASFTWorkflow:
     # MERGE
     # ========================================================
     def merge(self):
+
+        # What it means:
+        #
+        # - self.peft_config is None → you ran full fine-tuning (all model weights were trained directly), not LoRA/QLoRA/DoRA.
+        # - Merging is only needed for PEFT adapters — that's the step where a small LoRA adapter is baked into the base model so the final model works without loading the adapter separately.
+        # - In full fine-tuning there is no separate adapter — the trained weights already live in the model itself. So there's nothing to merge, and the step is correctly skipped.
+
         if self.peft_config is None:
-            print("\nFull fine-tuning: merge skipped because model is already full.")
+            print("\nFull fine-tuning: nothing to merge - full model was already saved to MERGED_DIR.")
             return
 
         if os.getenv("MERGE_MODEL"):
